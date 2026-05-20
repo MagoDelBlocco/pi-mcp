@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.js
+*.d.ts
+*.d.ts.map
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.local
+
+# MCP config (may contain API keys)
+mcp.json
+
+# Tooling
+.pi-lens/
+coverage/
+
+# Logs
+*.log
+npm-debug.log*
