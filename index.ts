@@ -461,6 +461,22 @@ class McpConnectionManager {
 	isConnected(name: string): boolean {
 		return this.servers.has(name);
 	}
+
+	/** Return a summary string of connected/disconnected servers. */
+	getServerSummary(): { text: string; color: "success" | "warning" | "error" } {
+		const config = loadConfig();
+		const servers = config.mcpServers ?? {};
+		const names = Object.keys(servers);
+		if (names.length === 0) return { text: "", color: "success" };
+
+		const connected = names.filter((n) => this.servers.has(n)).length;
+		const total = names.length;
+		const label = `MCP: ${connected}/${total} connected`;
+
+		if (connected === 0) return { text: label, color: "error" };
+		if (connected < total) return { text: label, color: "warning" };
+		return { text: label, color: "success" };
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -487,10 +503,16 @@ export default async function (pi: ExtensionAPI) {
 			return;
 		}
 
-		const status = names
-			.map((n) => (manager.isConnected(n) ? `✓ ${n}` : `✗ ${n}`))
-			.join(", ");
-		ctx.ui.notify(`MCP: ${status}`, "info");
+		const summary = manager.getServerSummary();
+		const bgMap: Record<string, string> = {
+			success: "toolSuccessBg",
+			warning: "toolPendingBg",
+			error: "toolErrorBg",
+		};
+		ctx.ui.setStatus(
+			"mcp-client",
+			`│ ${ctx.ui.theme.bg(bgMap[summary.color], ctx.ui.theme.fg(summary.color, summary.text))}`,
+		);
 	});
 
 	// Command: show connected servers
