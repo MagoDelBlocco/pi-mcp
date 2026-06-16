@@ -1,12 +1,17 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
 import { Client } from "@modelcontextprotocol/sdk/client";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
 import { readFileSync } from "node:fs";
+import {
+	buildToolName,
+	type JsonSchema,
+	mcpSchemaToTypeBox,
+} from "./schema.ts";
 
 // ---------------------------------------------------------------------------
 // Config types
@@ -22,6 +27,8 @@ interface McpServerConfig {
 	env?: Record<string, string>;
 	// Options
 	timeout?: number;
+	connectTimeout?: number;
+	/** @deprecated Use `connectTimeout`. Kept for backward compatibility. */
 	connect_timeout?: number;
 	// Tool control
 	directTools?: boolean;
@@ -43,97 +50,22 @@ function getConfigPath(): string {
 }
 
 function loadConfig(): McpConfig {
+	const path = getConfigPath();
+	let raw: string;
 	try {
-		return JSON.parse(readFileSync(getConfigPath(), "utf-8")) as McpConfig;
+		raw = readFileSync(path, "utf-8");
 	} catch {
+		// Missing config file is a normal "no servers configured" state.
 		return {};
 	}
-}
-
-/** Convert an MCP JSON Schema `inputSchema` to a TypeBox-compatible schema. */
-function mcpSchemaToTypeBox(
-	inputSchema: Record<string, unknown>,
-): Record<string, unknown> {
-	if (!inputSchema || typeof inputSchema !== "object") {
-		return Type.Object({});
+	try {
+		return JSON.parse(raw) as McpConfig;
+	} catch (err: any) {
+		// A malformed file is a real error the user should hear about — otherwise
+		// it looks identical to having no servers configured.
+		console.error(`[mcp-client] Failed to parse ${path}: ${err.message}`);
+		return {};
 	}
-
-	const schemaType = inputSchema.type as string | undefined;
-	const description = (inputSchema.description as string) ?? undefined;
-
-	// Handle primitive types directly (e.g., when called for array `items`)
-	switch (schemaType) {
-		case "string":
-			return Type.String({ description });
-		case "number":
-			return Type.Number({ description });
-		case "integer":
-			return Type.Integer({ description });
-		case "boolean":
-			return Type.Boolean({ description });
-		case "array": {
-			const items = inputSchema.items as Record<string, unknown> | undefined;
-			const itemType = items ? mcpSchemaToTypeBox(items) : Type.Unknown();
-			return Type.Array(itemType as any, { description });
-		}
-	}
-
-	// Handle object types (with properties)
-	const properties = (inputSchema.properties as Record<string, object>) ?? {};
-	const required = (inputSchema.required as string[]) ?? [];
-
-	const tbProps: Record<string, unknown> = {};
-	for (const [key, schema] of Object.entries(properties)) {
-		const s = schema as Record<string, unknown>;
-		let tbType: unknown;
-
-		switch (s.type) {
-			case "string":
-				tbType = Type.String({ description: s.description as string });
-				break;
-			case "number":
-				tbType = Type.Number({ description: s.description as string });
-				break;
-			case "integer":
-				tbType = Type.Integer({ description: s.description as string });
-				break;
-			case "boolean":
-				tbType = Type.Boolean({ description: s.description as string });
-				break;
-			case "array": {
-				const items = s.items as Record<string, unknown> | undefined;
-				const itemType = items ? mcpSchemaToTypeBox(items) : Type.Unknown();
-				tbType = Type.Array(itemType as any, {
-					description: s.description as string,
-				});
-				break;
-			}
-			case "object": {
-				tbType = mcpSchemaToTypeBox(s);
-				break;
-			}
-			default:
-				tbType = Type.Unknown({ description: s.description as string });
-		}
-
-		tbProps[key] = required.includes(key) ? tbType : Type.Optional(tbType);
-	}
-
-	return Type.Object(tbProps);
-}
-
-function sanitize(name: string): string {
-	return name.replace(/[^a-zA-Z0-9_-]/g, "_").replace(/\./g, "_");
-}
-
-function buildToolName(
-	serverName: string,
-	toolName: string,
-	direct: boolean,
-): string {
-	return direct
-		? sanitize(toolName)
-		: `mcp_${sanitize(serverName)}_${sanitize(toolName)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -142,56 +74,82 @@ function buildToolName(
 
 interface ServerConnection {
 	client: Client;
-	transport: any;
+	transport: Transport;
 	config: McpServerConfig;
+	/** Set before a deliberate close so the onclose handler doesn't reconnect. */
+	intentionalClose: boolean;
 }
 
+type ToolContent =
+	| { type: "text"; text: string }
+	| { type: "image"; data: string; mimeType: string };
+
 class McpConnectionManager {
+	private pi!: ExtensionAPI;
 	private servers = new Map<string, ServerConnection>();
 	private reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	private reconnectAttempts = new Map<string, number>();
+	/** Maps a registered tool name to the server that owns it (collision detection). */
+	private toolOwners = new Map<string, string>();
 
 	/** Connect to all configured servers and register their tools. */
 	async connectAll(pi: ExtensionAPI): Promise<void> {
+		this.pi = pi;
 		const config = loadConfig();
 		const servers = config.mcpServers ?? {};
 
 		for (const [name, serverConfig] of Object.entries(servers)) {
-			await this.connectServer(name, serverConfig, pi);
+			await this.establish(name, serverConfig);
 		}
 	}
 
-	private async connectServer(
-		name: string,
-		config: McpServerConfig,
-		pi: ExtensionAPI,
-	): Promise<void> {
+	/** Open a connection, register tools, and wire up reconnect-on-drop. */
+	private async establish(name: string, config: McpServerConfig): Promise<void> {
+		let connection: ServerConnection | undefined;
 		try {
-			const connection = await this.createConnection(name, config);
+			connection = await this.createConnection(name, config);
+			const toolCount = await this.registerTools(name, connection);
+
 			this.servers.set(name, connection);
 			this.reconnectAttempts.delete(name);
+			this.attachCloseHandler(name, config, connection);
 
-			// Discover and register tools
-			await this.registerTools(name, connection, pi);
-
-			const toolCount = await this.countEligibleTools(name, config);
 			console.log(`[mcp-client] ✓ "${name}" connected (${toolCount} tools)`);
 		} catch (err: any) {
+			if (connection) {
+				try {
+					await connection.transport.close();
+				} catch {
+					// ignore
+				}
+			}
 			console.error(`[mcp-client] ✗ "${name}" failed: ${err.message}`);
-			this.scheduleReconnect(name, config);
+			this.scheduleReconnect(name);
 		}
+	}
+
+	/** Reconnect when a previously healthy connection drops unexpectedly. */
+	private attachCloseHandler(
+		name: string,
+		config: McpServerConfig,
+		connection: ServerConnection,
+	): void {
+		connection.client.onclose = () => {
+			if (connection.intentionalClose) return;
+			// Ignore stale handlers from connections we've already replaced.
+			if (this.servers.get(name) !== connection) return;
+			this.servers.delete(name);
+			console.error(`[mcp-client] ⚠ "${name}" connection lost; scheduling reconnect`);
+			this.scheduleReconnect(name);
+		};
 	}
 
 	private async createConnection(
 		name: string,
 		config: McpServerConfig,
 	): Promise<ServerConnection> {
-		const client = new Client(
-			{ name: "pi-mcp-client", version: "1.0.0" },
-			{ capabilities: {} },
-		);
-
-		let transport: any;
+		const connectTimeout =
+			(config.connectTimeout ?? config.connect_timeout ?? 60) * 1000;
 
 		if (config.url) {
 			const url = new URL(config.url);
@@ -199,12 +157,44 @@ class McpConnectionManager {
 				? { requestInit: { headers: config.headers } }
 				: undefined;
 
-			if (config.transport === "sse") {
-				transport = new SSEClientTransport(url, httpOpts);
-			} else {
-				transport = new StreamableHTTPClientTransport(url, httpOpts);
+			// "auto" tries Streamable HTTP first, then falls back to SSE.
+			const modes: Array<"streamable-http" | "sse"> =
+				config.transport === "sse"
+					? ["sse"]
+					: config.transport === "streamable-http"
+						? ["streamable-http"]
+						: ["streamable-http", "sse"];
+
+			let lastErr: unknown;
+			for (const mode of modes) {
+				const client = this.newClient();
+				const transport: Transport =
+					mode === "sse"
+						? new SSEClientTransport(url, httpOpts)
+						: new StreamableHTTPClientTransport(url, httpOpts);
+				try {
+					await client.connect(transport, { timeout: connectTimeout });
+					return { client, transport, config, intentionalClose: false };
+				} catch (err: any) {
+					lastErr = err;
+					try {
+						await transport.close();
+					} catch {
+						// ignore
+					}
+					if (modes.length > 1) {
+						console.error(
+							`[mcp-client] "${name}" ${mode} transport failed: ${err.message}; trying next`,
+						);
+					}
+				}
 			}
-		} else if (config.command) {
+			throw lastErr instanceof Error
+				? lastErr
+				: new Error(`Unable to connect to "${name}"`);
+		}
+
+		if (config.command) {
 			const env: Record<string, string> = {};
 			for (const key of [
 				"PATH",
@@ -222,222 +212,177 @@ class McpConnectionManager {
 				Object.assign(env, config.env);
 			}
 
-			transport = new StdioClientTransport({
+			const transport = new StdioClientTransport({
 				command: config.command,
 				args: config.args ?? [],
 				env,
-				stderr: "inherit",
+				stderr: "pipe",
 			});
-		} else {
-			throw new Error(`Server "${name}" has no url or command configured`);
+			// Surface the child server's stderr under a clear prefix instead of
+			// letting it write straight to the terminal and corrupt the TUI.
+			transport.stderr?.on("data", (chunk: Buffer) => {
+				const text = chunk.toString().trimEnd();
+				if (text) console.error(`[mcp-client:${name}] ${text}`);
+			});
+
+			const client = this.newClient();
+			await client.connect(transport, { timeout: connectTimeout });
+			return { client, transport, config, intentionalClose: false };
 		}
 
-		const connectTimeout = (config.connect_timeout ?? 60) * 1000;
-		const timeoutId = setTimeout(() => {
-			throw new Error(
-				`Connection to "${name}" timed out after ${config.connect_timeout ?? 60}s`,
-			);
-		}, connectTimeout);
-
-		try {
-			await client.connect(transport);
-		} finally {
-			clearTimeout(timeoutId);
-		}
-
-		return { client, transport, config };
+		throw new Error(`Server "${name}" has no url or command configured`);
 	}
 
+	private newClient(): Client {
+		return new Client(
+			{ name: "pi-mcp-client", version: "1.0.0" },
+			{ capabilities: {} },
+		);
+	}
+
+	/** Discover and register the server's tools. Returns the registered count. */
 	private async registerTools(
 		name: string,
 		connection: ServerConnection,
-		pi: ExtensionAPI,
-	): Promise<void> {
+	): Promise<number> {
 		const { client, config } = connection;
 		const directTools = config.directTools ?? false;
 		const excludeTools = new Set(config.excludeTools ?? []);
-		const timeout = config.timeout ?? 120;
+		const timeoutMs = (config.timeout ?? 120) * 1000;
 
-		try {
-			const toolsResult = await client.listTools();
-			const tools = toolsResult.tools ?? [];
+		// A listTools failure means the connection isn't usable — let it propagate
+		// to establish() so the server is retried rather than left half-registered.
+		const toolsResult = await client.listTools();
+		const tools = toolsResult.tools ?? [];
 
-			for (const tool of tools) {
-				if (excludeTools.has(tool.name)) continue;
+		let count = 0;
+		for (const tool of tools) {
+			if (excludeTools.has(tool.name)) continue;
 
-				const toolName = buildToolName(name, tool.name, directTools);
-				const description = [
-					`MCP tool from server "${name}".`,
-					tool.description ? ` ${tool.description}` : "",
-				].join("");
+			const toolName = buildToolName(name, tool.name, directTools);
 
-				const parameters = mcpSchemaToTypeBox(
-					(tool.inputSchema as Record<string, unknown>) ?? {
-						type: "object",
-						properties: {},
-					},
+			const owner = this.toolOwners.get(toolName);
+			if (owner && owner !== name) {
+				console.error(
+					`[mcp-client] ⚠ tool "${toolName}" from "${name}" collides with "${owner}"; overriding`,
 				);
+			}
+			this.toolOwners.set(toolName, name);
 
-				pi.registerTool({
-					name: toolName,
-					label: `${name}/${tool.name}`,
-					description,
-					parameters: parameters as any,
-					async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-						const args: Record<string, unknown> = {};
-						for (const [key, value] of Object.entries(params ?? {})) {
-							args[key] = value;
+			const description = [
+				`MCP tool from server "${name}".`,
+				tool.description ? ` ${tool.description}` : "",
+			].join("");
+
+			// Tool parameters must be object-shaped; an empty or missing input
+			// schema becomes an empty object rather than an unconstrained value.
+			const rawSchema = tool.inputSchema as JsonSchema | undefined;
+			const parameters = mcpSchemaToTypeBox(
+				rawSchema && Object.keys(rawSchema).length > 0
+					? rawSchema
+					: { type: "object", properties: {} },
+			);
+
+			this.pi.registerTool({
+				name: toolName,
+				label: `${name}/${tool.name}`,
+				description,
+				parameters,
+				async execute(_toolCallId, params, signal) {
+					const args = (params ?? {}) as Record<string, unknown>;
+					try {
+						const result = await client.callTool(
+							{ name: tool.name, arguments: args },
+							undefined,
+							// The SDK enforces the timeout and honors the abort signal,
+							// so a hung call is actually cancelled (not just ignored).
+							{ timeout: timeoutMs, signal },
+						);
+
+						const contentParts: ToolContent[] = [];
+						for (const item of (result.content ?? []) as any[]) {
+							if (item.type === "text" && typeof item.text === "string") {
+								contentParts.push({ type: "text", text: item.text });
+							} else if (
+								item.type === "image" &&
+								"data" in item &&
+								"mimeType" in item
+							) {
+								contentParts.push({
+									type: "image",
+									data: item.data,
+									mimeType: item.mimeType,
+								});
+							} else if (item.type === "resource" && item.resource) {
+								const res = item.resource;
+								if (typeof res.text === "string") {
+									contentParts.push({ type: "text", text: res.text });
+								} else if (typeof res.uri === "string") {
+									contentParts.push({ type: "text", text: `Resource: ${res.uri}` });
+								} else {
+									contentParts.push({ type: "text", text: JSON.stringify(item) });
+								}
+							} else {
+								contentParts.push({ type: "text", text: JSON.stringify(item) });
+							}
 						}
 
-						const callTimeout = timeout * 1000;
-						const timeoutId = setTimeout(() => {
-							throw new Error(
-								`Tool "${tool.name}" timed out after ${timeout}s`,
-							);
-						}, callTimeout);
-
-						try {
-							const result = await client.callTool({
-								name: tool.name,
-								arguments: args,
-							});
-							clearTimeout(timeoutId);
-
-							const contentParts: Array<{ type: string; text?: string }> = [];
-							for (const item of result.content ?? []) {
-								if (item.type === "text" && "text" in item) {
-									contentParts.push({ type: "text", text: item.text });
-								} else if (
-									item.type === "image" &&
-									"data" in item &&
-									"mimeType" in item
-								) {
-									contentParts.push({
-										type: "text",
-										text: `[Image: ${item.mimeType}, ${item.data.length} bytes]`,
-									});
-								} else if (item.type === "resource") {
-									const res = item.resource;
-									if (res && "text" in res) {
-										contentParts.push({ type: "text", text: res.text });
-									} else if (res && "uri" in res) {
-										contentParts.push({
-											type: "text",
-											text: `Resource: ${res.uri}`,
-										});
-									}
-								} else {
-									contentParts.push({
-										type: "text",
-										text: JSON.stringify(item),
-									});
-								}
-							}
-
-							if (result.isError) {
-								return {
-									content:
-										(contentParts.length ?? 0)
-											? contentParts
-											: [{ type: "text", text: "Tool returned an error." }],
-									details: { isError: true, server: name, tool: tool.name },
-								};
-							}
-
+						if (result.isError) {
 							return {
 								content: contentParts.length
 									? contentParts
-									: [{ type: "text", text: "(no content)" }],
-								details: { server: name, tool: tool.name },
-							};
-						} catch (err: any) {
-							clearTimeout(timeoutId);
-							return {
-								content: [
-									{
-										type: "text",
-										text: `Error calling ${tool.name}: ${err.message}`,
-									},
-								],
-								details: { error: err.message, server: name, tool: tool.name },
+									: [{ type: "text", text: "Tool returned an error." }],
+								details: { isError: true, server: name, tool: tool.name },
 							};
 						}
-					},
-				});
-			}
-		} catch (err: any) {
-			console.error(
-				`[mcp-client] Failed to list tools for "${name}": ${err.message}`,
-			);
+
+						return {
+							content: contentParts.length
+								? contentParts
+								: [{ type: "text", text: "(no content)" }],
+							details: { server: name, tool: tool.name },
+						};
+					} catch (err: any) {
+						return {
+							content: [
+								{
+									type: "text",
+									text: `Error calling ${tool.name}: ${err.message}`,
+								},
+							],
+							details: { error: err.message, server: name, tool: tool.name },
+						};
+					}
+				},
+			});
+			count++;
 		}
+
+		return count;
 	}
 
-	private async countEligibleTools(
-		name: string,
-		config: McpServerConfig,
-	): Promise<number> {
-		const excludeTools = new Set(config.excludeTools ?? []);
-		const connection = this.servers.get(name);
-		if (!connection) return 0;
-
-		try {
-			const result = await connection.client.listTools();
-			return (result.tools ?? []).filter((t) => !excludeTools.has(t.name))
-				.length;
-		} catch {
-			return 0;
-		}
-	}
-
-	private scheduleReconnect(name: string, config: McpServerConfig): void {
+	private scheduleReconnect(name: string): void {
 		if (this.reconnectTimers.has(name)) return;
 
 		const attempt = (this.reconnectAttempts.get(name) ?? 0) + 1;
 		this.reconnectAttempts.set(name, attempt);
-		const delay = Math.min(1000 * 2 ** Math.min(5, attempt), 60_000);
+		// Exponent capped at 6 so the backoff actually reaches the 60s ceiling.
+		const delay = Math.min(1000 * 2 ** Math.min(6, attempt), 60_000);
 
 		console.log(
 			`[mcp-client] Retrying "${name}" in ${delay}ms (attempt ${attempt})`,
 		);
 
-		const timer = setTimeout(async () => {
+		const timer = setTimeout(() => {
 			this.reconnectTimers.delete(name);
-			// Reload config in case it changed
-			const freshConfig = loadConfig();
-			const serverConfig = freshConfig.mcpServers?.[name];
+			// Reload config in case it changed (or the server was removed).
+			const serverConfig = loadConfig().mcpServers?.[name];
 			if (serverConfig) {
-				// We need pi here — use a lazy approach
-				await this.connectServerWithPi(name, serverConfig);
+				void this.establish(name, serverConfig);
 			}
 		}, delay);
 
 		this.reconnectTimers.set(name, timer);
-	}
-
-	private async connectServerWithPi(
-		name: string,
-		config: McpServerConfig,
-	): Promise<void> {
-		// This is called from reconnect timers — we need to re-access pi.
-		// Use the global pi reference set during init.
-		if (!globalThis.__pi_mcp_api) {
-			console.error("[mcp-client] Cannot reconnect: pi API not available");
-			return;
-		}
-		const pi = globalThis.__pi_mcp_api as ExtensionAPI;
-		try {
-			const connection = await this.createConnection(name, config);
-			this.servers.set(name, connection);
-			this.reconnectAttempts.delete(name);
-			await this.registerTools(name, connection, pi);
-			const toolCount = await this.countEligibleTools(name, config);
-			console.log(`[mcp-client] ✓ "${name}" reconnected (${toolCount} tools)`);
-		} catch (err: any) {
-			console.error(
-				`[mcp-client] ✗ "${name}" reconnect failed: ${err.message}`,
-			);
-			this.scheduleReconnect(name, config);
-		}
 	}
 
 	/** Clean up all connections. */
@@ -446,8 +391,11 @@ class McpConnectionManager {
 			clearTimeout(timer);
 		}
 		this.reconnectTimers.clear();
+		this.reconnectAttempts.clear();
+		this.toolOwners.clear();
 
 		for (const [, conn] of this.servers) {
+			conn.intentionalClose = true;
 			try {
 				await conn.transport.close();
 			} catch {
@@ -486,17 +434,13 @@ class McpConnectionManager {
 const manager = new McpConnectionManager();
 
 export default async function (pi: ExtensionAPI) {
-	// Store pi reference for reconnect callbacks
-	(globalThis as any).__pi_mcp_api = pi;
-
 	// Connect to MCP servers (async factory is awaited before startup continues)
 	await manager.connectAll(pi);
 
 	// Notify user on session start
 	pi.on("session_start", async (_event, ctx) => {
 		const config = loadConfig();
-		const servers = config.mcpServers ?? {};
-		const names = Object.keys(servers);
+		const names = Object.keys(config.mcpServers ?? {});
 
 		if (names.length === 0) {
 			console.log("[mcp-client] No MCP servers configured");
@@ -504,14 +448,17 @@ export default async function (pi: ExtensionAPI) {
 		}
 
 		const summary = manager.getServerSummary();
-		const bgMap: Record<string, string> = {
+		const bgMap = {
 			success: "toolSuccessBg",
 			warning: "toolPendingBg",
 			error: "toolErrorBg",
-		};
+		} as const;
 		ctx.ui.setStatus(
 			"mcp-client",
-			`│ ${ctx.ui.theme.bg(bgMap[summary.color], ctx.ui.theme.fg(summary.color, summary.text))}`,
+			ctx.ui.theme.bg(
+				bgMap[summary.color],
+				ctx.ui.theme.fg(summary.color, summary.text),
+			),
 		);
 	});
 
@@ -523,7 +470,7 @@ export default async function (pi: ExtensionAPI) {
 			const servers = config.mcpServers ?? {};
 			const lines: string[] = [];
 
-			for (const [name] of Object.entries(servers)) {
+			for (const name of Object.keys(servers)) {
 				const connected = manager.isConnected(name);
 				lines.push(`  ${connected ? "✓" : "✗"} ${name}`);
 			}

@@ -73,7 +73,7 @@ Create `~/.pi/agent/mcp.json` with your server definitions:
 | `env`             | `object`   | —        | Extra environment variables for stdio                      |
 | `transport`       | `string`   | `"auto"` | Force transport: `"auto"`, `"streamable-http"`, or `"sse"` |
 | `timeout`         | `number`   | `120`    | Tool call timeout in seconds                               |
-| `connect_timeout` | `number`   | `60`     | Connection timeout in seconds                              |
+| `connectTimeout`  | `number`   | `60`     | Connection timeout in seconds (alias: `connect_timeout`)   |
 | `directTools`     | `boolean`  | `false`  | Register tools without server prefix                       |
 | `excludeTools`    | `string[]` | `[]`     | Tool names to skip                                         |
 
@@ -94,11 +94,17 @@ Set `"directTools": true` to register tools under their original names (useful w
 
 When `url` is provided, the transport is determined by the `transport` option:
 
-- `"auto"` (default): Uses Streamable HTTP transport
-- `"streamable-http"`: Explicitly uses Streamable HTTP
+- `"auto"` (default): Tries Streamable HTTP first, then falls back to SSE if the connection fails
+- `"streamable-http"`: Explicitly uses Streamable HTTP (no fallback)
 - `"sse"`: Uses SSE transport
 
 When `command` is provided, stdio transport is used automatically.
+
+## Reconnection
+
+Failed connections are retried with exponential backoff (capped at 60s). Servers
+that drop after a successful connection are detected and reconnected
+automatically.
 
 ## Testing
 

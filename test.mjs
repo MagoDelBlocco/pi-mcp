@@ -1,89 +1,8 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { Type } from "typebox";
-
-// ---------------------------------------------------------------------------
-// Inline the functions under test (mirrors index.ts logic)
-// ---------------------------------------------------------------------------
-
-/** Convert an MCP JSON Schema `inputSchema` to a TypeBox-compatible schema. */
-function mcpSchemaToTypeBox(inputSchema) {
-	if (!inputSchema || typeof inputSchema !== "object") {
-		return Type.Object({});
-	}
-
-	const schemaType = inputSchema.type;
-	const description = inputSchema.description ?? undefined;
-
-	// Handle primitive types directly (e.g., when called for array `items`)
-	switch (schemaType) {
-		case "string":
-			return Type.String({ description });
-		case "number":
-			return Type.Number({ description });
-		case "integer":
-			return Type.Integer({ description });
-		case "boolean":
-			return Type.Boolean({ description });
-		case "array": {
-			const items = inputSchema.items;
-			const itemType = items ? mcpSchemaToTypeBox(items) : Type.Unknown();
-			return Type.Array(itemType, { description });
-		}
-	}
-
-	// Handle object types (with properties)
-	const properties = inputSchema.properties ?? {};
-	const required = inputSchema.required ?? [];
-
-	const tbProps = {};
-	for (const [key, schema] of Object.entries(properties)) {
-		const s = schema;
-		let tbType;
-
-		switch (s.type) {
-			case "string":
-				tbType = Type.String({ description: s.description });
-				break;
-			case "number":
-				tbType = Type.Number({ description: s.description });
-				break;
-			case "integer":
-				tbType = Type.Integer({ description: s.description });
-				break;
-			case "boolean":
-				tbType = Type.Boolean({ description: s.description });
-				break;
-			case "array": {
-				const items = s.items;
-				const itemType = items ? mcpSchemaToTypeBox(items) : Type.Unknown();
-				tbType = Type.Array(itemType, {
-					description: s.description,
-				});
-				break;
-			}
-			case "object":
-				tbType = mcpSchemaToTypeBox(s);
-				break;
-			default:
-				tbType = Type.Unknown({ description: s.description });
-		}
-
-		tbProps[key] = required.includes(key) ? tbType : Type.Optional(tbType);
-	}
-
-	return Type.Object(tbProps);
-}
-
-function sanitize(name) {
-	return name.replace(/[^a-zA-Z0-9_-]/g, "_").replace(/\./g, "_");
-}
-
-function buildToolName(serverName, toolName, direct) {
-	return direct
-		? sanitize(toolName)
-		: `mcp_${sanitize(serverName)}_${sanitize(toolName)}`;
-}
+// Import the real implementation so tests can't drift from the extension.
+// Node strips the TypeScript types when loading the .ts module.
+import { mcpSchemaToTypeBox, sanitize, buildToolName } from "./schema.ts";
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -434,19 +353,35 @@ describe("mcpSchemaToTypeBox", () => {
 			assert.equal(result.type, "object");
 		});
 
-		test("empty object returns empty TypeBox object", () => {
+		test("empty schema is unconstrained (any)", () => {
+			// `{}` in JSON Schema means "anything", so it maps to Unknown.
+			// registerTools() wraps the tool's top-level schema in an object,
+			// so tool parameters are still object-shaped.
 			const result = mcpSchemaToTypeBox({});
-			assert.equal(result.type, "object");
+			assert.ok(
+				!result.type || result.type === "unknown",
+				"empty schema should be unconstrained",
+			);
 		});
 
-		test("schema with unknown type maps to unknown", () => {
+		test("null type is preserved", () => {
 			const result = mcpSchemaToTypeBox({
 				type: "object",
 				properties: {
 					data: { type: "null" },
 				},
 			});
-			// "null" is not a recognized type → should fall through to default (Unknown)
+			assert.equal(result.properties.data.type, "null");
+		});
+
+		test("unrecognized type maps to unknown", () => {
+			const result = mcpSchemaToTypeBox({
+				type: "object",
+				properties: {
+					data: { type: "totally-made-up" },
+				},
+			});
+			// An unknown type with no object-like keys falls through to Unknown.
 			assert.ok(
 				!result.properties.data.type ||
 					result.properties.data.type === "unknown",
@@ -534,6 +469,79 @@ describe("mcpSchemaToTypeBox", () => {
 				"deeply nested integer should be preserved",
 			);
 		});
+	});
+});
+
+describe("mcpSchemaToTypeBox — rich features", () => {
+	test("enum maps to a union of literals", () => {
+		const result = mcpSchemaToTypeBox({
+			type: "string",
+			enum: ["a", "b", "c"],
+		});
+		assert.ok(Array.isArray(result.anyOf), "enum should produce a union");
+		assert.deepEqual(
+			result.anyOf.map((s) => s.const),
+			["a", "b", "c"],
+		);
+	});
+
+	test("single-value enum maps to a literal", () => {
+		const result = mcpSchemaToTypeBox({ enum: ["only"] });
+		assert.equal(result.const, "only");
+	});
+
+	test("const is preserved as a literal", () => {
+		const result = mcpSchemaToTypeBox({ const: "fixed" });
+		assert.equal(result.const, "fixed");
+	});
+
+	test("default value is preserved", () => {
+		const result = mcpSchemaToTypeBox({ type: "string", default: "hi" });
+		assert.equal(result.default, "hi");
+	});
+
+	test("nullable type array maps to a union including null", () => {
+		const result = mcpSchemaToTypeBox({ type: ["string", "null"] });
+		assert.ok(Array.isArray(result.anyOf));
+		assert.deepEqual(
+			result.anyOf.map((s) => s.type),
+			["string", "null"],
+		);
+	});
+
+	test("anyOf maps to a union", () => {
+		const result = mcpSchemaToTypeBox({
+			anyOf: [{ type: "string" }, { type: "number" }],
+		});
+		assert.deepEqual(
+			result.anyOf.map((s) => s.type),
+			["string", "number"],
+		);
+	});
+
+	test("numeric bounds are preserved", () => {
+		const result = mcpSchemaToTypeBox({ type: "integer", minimum: 1, maximum: 10 });
+		assert.equal(result.type, "integer");
+		assert.equal(result.minimum, 1);
+		assert.equal(result.maximum, 10);
+	});
+
+	test("additionalProperties: false is preserved", () => {
+		const result = mcpSchemaToTypeBox({
+			type: "object",
+			properties: { a: { type: "string" } },
+			additionalProperties: false,
+		});
+		assert.equal(result.additionalProperties, false);
+	});
+
+	test("top-level object description is preserved", () => {
+		const result = mcpSchemaToTypeBox({
+			type: "object",
+			description: "Search parameters",
+			properties: { q: { type: "string" } },
+		});
+		assert.equal(result.description, "Search parameters");
 	});
 });
 
