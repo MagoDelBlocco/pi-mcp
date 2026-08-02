@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { Client } from "@modelcontextprotocol/sdk/client";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse";
@@ -91,6 +91,12 @@ class McpConnectionManager {
 	private reconnectAttempts = new Map<string, number>();
 	/** Maps a registered tool name to the server that owns it (collision detection). */
 	private toolOwners = new Map<string, string>();
+	/** UI context captured from a session/command, so retry status can refresh in place. */
+	private ui?: ExtensionUIContext;
+	/** Whether an updating UI (TUI/RPC) is available; false in print/JSON modes. */
+	private hasUI = false;
+	/** Most recent failure message per server, shown in the single retry status. */
+	private lastErrors = new Map<string, string>();
 
 	/** Connect to all configured servers and register their tools. */
 	async connectAll(pi: ExtensionAPI): Promise<void> {
@@ -103,6 +109,12 @@ class McpConnectionManager {
 		}
 	}
 
+	/** Capture the UI context so retry status can update in place. */
+	setUI(ui: ExtensionUIContext, hasUI: boolean): void {
+		this.ui = ui;
+		this.hasUI = hasUI;
+	}
+
 	/** Open a connection, register tools, and wire up reconnect-on-drop. */
 	private async establish(name: string, config: McpServerConfig): Promise<void> {
 		let connection: ServerConnection | undefined;
@@ -112,6 +124,7 @@ class McpConnectionManager {
 
 			this.servers.set(name, connection);
 			this.reconnectAttempts.delete(name);
+			this.clearRetryStatus(name);
 			this.attachCloseHandler(name, config, connection);
 
 			console.log(`[mcp-client] ✓ "${name}" connected (${toolCount} tools)`);
@@ -123,7 +136,7 @@ class McpConnectionManager {
 					// ignore
 				}
 			}
-			console.error(`[mcp-client] ✗ "${name}" failed: ${err.message}`);
+			this.lastErrors.set(name, err?.message ?? String(err));
 			this.scheduleReconnect(name);
 		}
 	}
@@ -139,7 +152,6 @@ class McpConnectionManager {
 			// Ignore stale handlers from connections we've already replaced.
 			if (this.servers.get(name) !== connection) return;
 			this.servers.delete(name);
-			console.error(`[mcp-client] ⚠ "${name}" connection lost; scheduling reconnect`);
 			this.scheduleReconnect(name);
 		};
 	}
@@ -361,6 +373,38 @@ class McpConnectionManager {
 		return count;
 	}
 
+	private static retryKey(name: string): string {
+		return `mcp-retry:${name}`;
+	}
+
+	/**
+	 * Show/refresh a single per-server status while reconnecting, instead of
+	 * emitting a new terminal line per attempt. When no updating UI exists
+	 * (print/JSON modes), log once on the first attempt to avoid spam.
+	 */
+	private updateRetryStatus(name: string, attempt: number, delayMs: number): void {
+		const seconds = Math.max(1, Math.round(delayMs / 1000));
+		const err = this.lastErrors.get(name);
+		const text =
+			`⚠ MCP "${name}" down — retrying in ${seconds}s (attempt ${attempt})` +
+			(err ? ` — ${err}` : "");
+		if (this.ui && this.hasUI) {
+			this.ui.setStatus(McpConnectionManager.retryKey(name), text);
+		} else if (attempt === 1 && process.env.MCP_DEBUG) {
+			// No updating UI (print/JSON modes). Log once, gated behind a debug flag,
+			// so retries never spam the terminal in normal production runs.
+			console.warn(`[mcp-client] ${text}`);
+		}
+	}
+
+	/** Clear a server's retry status (e.g. once it reconnects). */
+	private clearRetryStatus(name: string): void {
+		this.lastErrors.delete(name);
+		if (this.ui && this.hasUI) {
+			this.ui.setStatus(McpConnectionManager.retryKey(name), undefined);
+		}
+	}
+
 	private scheduleReconnect(name: string): void {
 		if (this.reconnectTimers.has(name)) return;
 
@@ -369,9 +413,9 @@ class McpConnectionManager {
 		// Exponent capped at 6 so the backoff actually reaches the 60s ceiling.
 		const delay = Math.min(1000 * 2 ** Math.min(6, attempt), 60_000);
 
-		console.log(
-			`[mcp-client] Retrying "${name}" in ${delay}ms (attempt ${attempt})`,
-		);
+		// Show one status per server, refreshed in place on each attempt, instead
+		// of emitting a new terminal line per retry.
+		this.updateRetryStatus(name, attempt, delay);
 
 		const timer = setTimeout(() => {
 			this.reconnectTimers.delete(name);
@@ -387,12 +431,15 @@ class McpConnectionManager {
 
 	/** Clean up all connections. */
 	async disconnectAll(): Promise<void> {
+		const retrying = [...this.reconnectTimers.keys()];
 		for (const timer of this.reconnectTimers.values()) {
 			clearTimeout(timer);
 		}
 		this.reconnectTimers.clear();
 		this.reconnectAttempts.clear();
 		this.toolOwners.clear();
+		this.lastErrors.clear();
+		for (const name of retrying) this.clearRetryStatus(name);
 
 		for (const [, conn] of this.servers) {
 			conn.intentionalClose = true;
@@ -439,6 +486,7 @@ export default async function (pi: ExtensionAPI) {
 
 	// Notify user on session start
 	pi.on("session_start", async (_event, ctx) => {
+		manager.setUI(ctx.ui, ctx.hasUI);
 		const config = loadConfig();
 		const names = Object.keys(config.mcpServers ?? {});
 
@@ -466,6 +514,7 @@ export default async function (pi: ExtensionAPI) {
 	pi.registerCommand("mcp-status", {
 		description: "Show MCP server connection status",
 		handler: async (_args, ctx) => {
+			manager.setUI(ctx.ui, ctx.hasUI);
 			const config = loadConfig();
 			const servers = config.mcpServers ?? {};
 			const lines: string[] = [];
@@ -487,6 +536,7 @@ export default async function (pi: ExtensionAPI) {
 	pi.registerCommand("mcp-reload", {
 		description: "Reload MCP server connections",
 		handler: async (_args, ctx) => {
+			manager.setUI(ctx.ui, ctx.hasUI);
 			await manager.disconnectAll();
 			await manager.connectAll(pi);
 			ctx.ui.notify("MCP connections reloaded", "info");
